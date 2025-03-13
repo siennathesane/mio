@@ -1,11 +1,19 @@
-use std::io;
-use std::mem::size_of;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::{
+    io,
+    mem::size_of,
+    net::{
+        Ipv4Addr,
+        Ipv6Addr,
+        SocketAddr,
+        SocketAddrV4,
+        SocketAddrV6,
+    },
+};
 
 pub(crate) fn new_ip_socket(addr: SocketAddr, socket_type: libc::c_int) -> io::Result<libc::c_int> {
     let domain = match addr {
-        SocketAddr::V4(..) => libc::AF_INET,
-        SocketAddr::V6(..) => libc::AF_INET6,
+        | SocketAddr::V4(..) => libc::AF_INET,
+        | SocketAddr::V6(..) => libc::AF_INET6,
     };
 
     new_socket(domain, socket_type)
@@ -77,10 +85,93 @@ pub(crate) fn new_socket(domain: libc::c_int, socket_type: libc::c_int) -> io::R
     Ok(socket)
 }
 
-/// A type with the same memory layout as `libc::sockaddr`. Used in converting Rust level
-/// SocketAddr* types into their system representation. The benefit of this specific
-/// type over using `libc::sockaddr_storage` is that this type is exactly as large as it
-/// needs to be and not a lot larger. And it can be initialized cleaner from Rust.
+/// Enable socket timestamping (both hardware and software)
+/// This is only available on Linux systems.
+#[cfg(target_os = "linux")]
+#[allow(unused)]
+pub(crate) fn enable_socket_timestamping(socket: libc::c_int) -> io::Result<()> {
+    use std::mem;
+
+    // Combined flags for both hardware and software timestamping
+    let timestamping_flags = libc::SOF_TIMESTAMPING_SOFTWARE |
+        libc::SOF_TIMESTAMPING_RX_SOFTWARE |
+        libc::SOF_TIMESTAMPING_TX_SOFTWARE |
+        libc::SOF_TIMESTAMPING_RX_HARDWARE |
+        libc::SOF_TIMESTAMPING_TX_HARDWARE |
+        libc::SOF_TIMESTAMPING_RAW_HARDWARE |
+        libc::SOF_TIMESTAMPING_SYS_HARDWARE;
+
+    // Enable timestamping on the socket
+    syscall!(setsockopt(
+        socket,
+        libc::SOL_SOCKET,
+        libc::SO_TIMESTAMPING,
+        &timestamping_flags as *const _ as *const libc::c_void,
+        mem::size_of::<libc::c_int>() as libc::socklen_t
+    ))?;
+
+    Ok(())
+}
+
+/// Enable hardware timestamping on network device bound to the socket
+#[cfg(target_os = "linux")]
+#[allow(unused)]
+pub(crate) fn enable_hardware_timestamping_on_device(
+    socket: libc::c_int,
+    interface_name: &str,
+) -> io::Result<()> {
+    use std::ffi::CString;
+
+    // hwtstamp_config struct layout matching Linux kernel definition
+    #[repr(C)]
+    struct HwTimestampConfig {
+        flags: u32,
+        tx_type: u32,
+        rx_filter: u32,
+    }
+    
+    let mut hwconfig = HwTimestampConfig {
+        flags: 0,                             // Reserved for future use
+        tx_type: libc::HWTSTAMP_TX_ON,        // Enable hardware timestamping for outgoing packets
+        rx_filter: libc::HWTSTAMP_FILTER_ALL, // Timestamp all incoming packets
+    };
+    
+    let if_name = match CString::new(interface_name) {
+        | Ok(name) => name,
+        | Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid interface name",
+            ))
+        },
+    };
+    
+    let mut ifreq: libc::ifreq = unsafe { std::mem::zeroed() };
+    
+    let if_name_bytes = if_name.as_bytes_with_nul();
+    if if_name_bytes.len() > libc::IF_NAMESIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Interface name too long",
+        ));
+    }
+
+    for (i, &byte) in if_name_bytes.iter().enumerate() {
+        ifreq.ifr_name[i] = byte as libc::c_char;
+    }
+    ifreq.ifr_ifru.ifru_data = &mut hwconfig as *mut _ as *mut libc::c_char;
+
+    // Configure hardware timestamping on the interface
+    syscall!(ioctl(socket, libc::SIOCSHWTSTAMP, &mut ifreq))?;
+
+    Ok(())
+}
+
+/// A type with the same memory layout as `libc::sockaddr`. Used in converting
+/// Rust level SocketAddr* types into their system representation. The benefit
+/// of this specific type over using `libc::sockaddr_storage` is that this type
+/// is exactly as large as it needs to be and not a lot larger. And it can be
+/// initialized cleaner from Rust.
 #[repr(C)]
 pub(crate) union SocketAddrCRepr {
     v4: libc::sockaddr_in,
@@ -96,7 +187,7 @@ impl SocketAddrCRepr {
 /// Converts a Rust `SocketAddr` into the system representation.
 pub(crate) fn socket_addr(addr: &SocketAddr) -> (SocketAddrCRepr, libc::socklen_t) {
     match addr {
-        SocketAddr::V4(ref addr) => {
+        | SocketAddr::V4(ref addr) => {
             // `s_addr` is stored as BE on all machine and the array is in BE order.
             // So the native endian conversion method is used so that it's never swapped.
             let sin_addr = libc::in_addr {
@@ -139,8 +230,8 @@ pub(crate) fn socket_addr(addr: &SocketAddr) -> (SocketAddrCRepr, libc::socklen_
             let sockaddr = SocketAddrCRepr { v4: sockaddr_in };
             let socklen = size_of::<libc::sockaddr_in>() as libc::socklen_t;
             (sockaddr, socklen)
-        }
-        SocketAddr::V6(ref addr) => {
+        },
+        | SocketAddr::V6(ref addr) => {
             let sockaddr_in6 = libc::sockaddr_in6 {
                 sin6_family: libc::AF_INET6 as libc::sa_family_t,
                 sin6_port: addr.port().to_be(),
@@ -177,11 +268,12 @@ pub(crate) fn socket_addr(addr: &SocketAddr) -> (SocketAddrCRepr, libc::socklen_
             let sockaddr = SocketAddrCRepr { v6: sockaddr_in6 };
             let socklen = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
             (sockaddr, socklen)
-        }
+        },
     }
 }
 
-/// Converts a `libc::sockaddr` compatible struct into a native Rust `SocketAddr`.
+/// Converts a `libc::sockaddr` compatible struct into a native Rust
+/// `SocketAddr`.
 ///
 /// # Safety
 ///
@@ -191,15 +283,16 @@ pub(crate) unsafe fn to_socket_addr(
     storage: *const libc::sockaddr_storage,
 ) -> io::Result<SocketAddr> {
     match (*storage).ss_family as libc::c_int {
-        libc::AF_INET => {
+        | libc::AF_INET => {
             // Safety: if the ss_family field is AF_INET then storage must be a sockaddr_in.
             let addr: &libc::sockaddr_in = &*(storage as *const libc::sockaddr_in);
             let ip = Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
             let port = u16::from_be(addr.sin_port);
             Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
-        }
-        libc::AF_INET6 => {
-            // Safety: if the ss_family field is AF_INET6 then storage must be a sockaddr_in6.
+        },
+        | libc::AF_INET6 => {
+            // Safety: if the ss_family field is AF_INET6 then storage must be a
+            // sockaddr_in6.
             let addr: &libc::sockaddr_in6 = &*(storage as *const libc::sockaddr_in6);
             let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
             let port = u16::from_be(addr.sin6_port);
@@ -209,7 +302,7 @@ pub(crate) unsafe fn to_socket_addr(
                 addr.sin6_flowinfo,
                 addr.sin6_scope_id,
             )))
-        }
-        _ => Err(io::ErrorKind::InvalidInput.into()),
+        },
+        | _ => Err(io::ErrorKind::InvalidInput.into()),
     }
 }
